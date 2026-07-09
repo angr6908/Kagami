@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest  # Apple Silicon, so the default target is aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      # Pull the official signed libvlc straight from VideoLAN (no brew, no
+      # install): macOS ships libvlc only inside VLC.app, so we fetch the pinned
+      # .dmg, verify its checksum, and extract just lib/ + plugins/ into
+      # vendor/vlc, where build.rs links against it and the bundle step vendors
+      # it into the .app.
+      - name: Fetch libvlc from VideoLAN
+        run: |
+          ver=3.0.23
+          dmg="vlc-${ver}-arm64.dmg"
+          sha=fc6fac08d87f538517d44aca0c5e7a244b67c8c4cb589bf478363a7315fd5e0d
+          curl -fsSL -o "$dmg" "https://get.videolan.org/vlc/${ver}/macosx/${dmg}"
+          echo "${sha}  ${dmg}" | shasum -a 256 -c -
+          hdiutil attach "$dmg" -nobrowse -mountpoint /Volumes/VLC
+          mkdir -p vendor/vlc
+          cp -R /Volumes/VLC/VLC.app/Contents/MacOS/lib vendor/vlc/lib
+          cp -R /Volumes/VLC/VLC.app/Contents/MacOS/plugins vendor/vlc/plugins
+          hdiutil detach /Volumes/VLC
+      - run: cargo build --release
+
+      - name: Package Kagami.app  # .app bundle launches without a terminal
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          app="Kagami.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/Kagami "$app/Contents/MacOS/"
+
+          # Vendor libvlc + its plugins into the bundle so the .app is
+          # self-contained and needs nothing installed. Built-ins only.
+          bash scripts/bundle-macos.sh "$app/Contents/MacOS/Kagami" "$app/Contents/Frameworks" "$PWD/vendor/vlc"
+
+          # Build AppIcon.icns from the 1024px source.
+          iconset="AppIcon.iconset"; mkdir -p "$iconset"
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon.png --out "$iconset/icon_${s}x${s}.png"
+            sips -z $((s*2)) $((s*2)) assets/icon.png --out "$iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Kagami</string>
+            <key>CFBundleExecutable</key><string>Kagami</string>
+            <key>CFBundleIdentifier</key><string>com.Kagami.Kagami</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>CFBundleDocumentTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleTypeName</key><string>Image</string>
+                <key>CFBundleTypeRole</key><string>Viewer</string>
+                <key>LSHandlerRank</key><string>Alternate</string>
+                <key>LSItemContentTypes</key>
+                <array><string>public.image</string></array>
+              </dict>
+              <dict>
+                <key>CFBundleTypeName</key><string>Movie</string>
+                <key>CFBundleTypeRole</key><string>Viewer</string>
+                <key>LSHandlerRank</key><string>Alternate</string>
+                <key>LSItemContentTypes</key>
+                <array><string>public.movie</string></array>
+              </dict>
+            </array>
+          </dict></plist>
+          PLIST
+          codesign --force --sign - "$app"  # ad-hoc sign (required on arm64)
+          # Name the asset after the full tag (e.g. Kagami-v1.0.0.zip); the plist
+          # above still uses the bare number, which CFBundleShortVersionString wants.
+          ditto -c -k --keepParent "$app" "Kagami-${GITHUB_REF_NAME}.zip"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: Kagami-*.zip
