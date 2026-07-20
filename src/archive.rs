@@ -29,6 +29,12 @@ pub enum Item {
     File(PathBuf),
     /// `archive` is shared across all entries of the same archive.
     Archived { archive: Arc<PathBuf>, entry: String },
+    /// One page's embedded image inside an image-only PDF. `doc` (the parsed
+    /// PDF) is shared across every page, as `archive` is across zip entries;
+    /// `name` is a synthetic image filename giving the page its order and title.
+    /// `inner` names the PDF's entry within its archive when the PDF is itself
+    /// nested inside a zip/cbz, and is None for a plain PDF file on disk.
+    Pdf { doc: Arc<crate::pdf::PdfDoc>, page: usize, inner: Option<String>, name: String },
 }
 
 impl Item {
@@ -37,6 +43,7 @@ impl Item {
         match self {
             Item::File(p) => p,
             Item::Archived { entry, .. } => Path::new(entry),
+            Item::Pdf { name, .. } => Path::new(name),
         }
     }
 
@@ -46,11 +53,16 @@ impl Item {
         match self {
             Item::File(p) => p,
             Item::Archived { archive, .. } => archive,
+            Item::Pdf { doc, .. } => doc.disk(),
         }
     }
 
     pub fn is_archived(&self) -> bool {
         matches!(self, Item::Archived { .. })
+    }
+
+    pub fn is_pdf(&self) -> bool {
+        matches!(self, Item::Pdf { .. })
     }
 
     /// Title string relative to the opened root: `sub/img.jpg`, or
@@ -61,6 +73,12 @@ impl Item {
         match self {
             Item::File(_) => disk.into_owned(),
             Item::Archived { entry, .. } => format!("{disk}/{entry}"),
+            // `disk` is the PDF file, or the archive when the PDF is nested; in
+            // the nested case `inner` slots the PDF's own name in between.
+            Item::Pdf { inner, name, .. } => match inner {
+                Some(entry) => format!("{disk}/{entry}/{name}"),
+                None => format!("{disk}/{name}"),
+            },
         }
     }
 
@@ -71,6 +89,14 @@ impl Item {
             Item::File(p) => p.to_string_lossy().to_ascii_lowercase(),
             Item::Archived { archive, entry } => {
                 format!("{}/{entry}", archive.to_string_lossy()).to_ascii_lowercase()
+            }
+            Item::Pdf { doc, inner, name, .. } => {
+                let disk = doc.disk().to_string_lossy();
+                match inner {
+                    Some(entry) => format!("{disk}/{entry}/{name}"),
+                    None => format!("{disk}/{name}"),
+                }
+                .to_ascii_lowercase()
             }
         }
     }
@@ -100,6 +126,8 @@ impl Item {
                 let size = entry.size() as usize;
                 read_chunked(entry, size, &|| false).map(VideoSource::Bytes)
             }
+            // PDF entries are always images, never video.
+            Item::Pdf { .. } => None,
         }
     }
 
@@ -116,6 +144,18 @@ impl Item {
                 let size = entry.size() as usize;
                 read_chunked(entry, size, cancelled)
             }
+            // PDF pages don't use the file-bytes path; they are decoded from
+            // the resident document via `pdf_image` in the decode worker.
+            Item::Pdf { .. } => None,
+        }
+    }
+
+    /// A PDF page's extracted image, decoded straight from the resident
+    /// document. None for every non-PDF item (which use [`Item::read`]).
+    pub fn pdf_image(&self) -> Option<crate::pdf::PdfImage> {
+        match self {
+            Item::Pdf { doc, page, .. } => doc.page_image(*page),
+            _ => None,
         }
     }
 }
@@ -128,19 +168,42 @@ pub enum VideoSource {
 }
 
 /// List an archive's media entries (per `is_media`), skipping directories and
-/// metadata junk. Unreadable/encrypted archives yield an empty list.
+/// metadata junk. Nested PDFs are expanded in place into their page images, the
+/// same way a PDF on disk is. Unreadable/encrypted archives yield an empty list.
 pub fn scan_archive(path: &Path, is_media: impl Fn(&Path) -> bool) -> Vec<Item> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    let Ok(zip) = zip::ZipArchive::new(BufReader::new(file)) else {
+    let Ok(mut zip) = zip::ZipArchive::new(BufReader::new(file)) else {
         return Vec::new();
     };
     let archive = Arc::new(path.to_path_buf());
-    zip.file_names()
-        .filter(|name| !name.ends_with('/') && !is_junk(name) && is_media(Path::new(name)))
-        .map(|name| Item::Archived { archive: archive.clone(), entry: name.to_string() })
-        .collect()
+    // Snapshot the entry names first so the archive can be re-borrowed mutably
+    // below to decompress any nested PDFs.
+    let names: Vec<String> = zip
+        .file_names()
+        .filter(|name| !name.ends_with('/') && !is_junk(name))
+        .map(str::to_string)
+        .collect();
+    let mut items = Vec::new();
+    for name in names {
+        let p = Path::new(&name);
+        if is_media(p) {
+            items.push(Item::Archived { archive: archive.clone(), entry: name });
+        } else if crate::pdf::is_pdf_file(p)
+            && let Some(bytes) = read_named(&mut zip, &name)
+        {
+            items.extend(crate::pdf::scan_pdf_bytes(path, &name, &bytes));
+        }
+    }
+    items
+}
+
+/// Decompress one archive entry, by name, fully into memory.
+fn read_named(zip: &mut zip::ZipArchive<BufReader<std::fs::File>>, name: &str) -> Option<Vec<u8>> {
+    let entry = zip.by_name(name).ok()?;
+    let size = entry.size() as usize;
+    read_chunked(entry, size, &|| false)
 }
 
 /// macOS zips are littered with `__MACOSX/` resource forks and `._*`/`.DS_Store`

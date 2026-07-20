@@ -13,6 +13,9 @@ use std::time::Duration;
 mod archive;
 use archive::{Item, READ_CHUNK, VideoSource, has_ext, is_archive_file, scan_archive};
 
+mod pdf;
+use pdf::{PdfImage, is_pdf_file, scan_pdf};
+
 mod video;
 use video::{VideoPlayer, is_video_file};
 
@@ -34,10 +37,6 @@ const DECODE_BEHIND: usize = 2;
 const DECODE_WORKERS: usize = 3;
 const PRIORITY_WORKERS: usize = 2;
 const MAX_DECODE_RETRIES: usize = 3;
-// Images are always scaled to fit the window, so a texture larger than the
-// display is wasted decode time, upload bandwidth and memory. Cap the longest
-// side; 4096 stays crisp when fitting onto a 4K/5K screen.
-const DISPLAY_MAX_DIM: u32 = 4096;
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tiff"];
 
 /// A fixed-size pool of worker threads pulling jobs off a shared channel. This
@@ -188,6 +187,8 @@ fn scan_directory(dir: &Path) -> Vec<Item> {
                         items.push(Item::File(p));
                     } else if is_archive_file(&p) {
                         items.extend(scan_archive(&p, is_media_name));
+                    } else if is_pdf_file(&p) {
+                        items.extend(scan_pdf(&p));
                     }
                 }
                 _ => {}
@@ -305,6 +306,19 @@ fn decode_from_bytes(data: &[u8], max_side: u32) -> Result<Decoded> {
     Ok(Decoded { width: w, height: h, frames: vec![(pixels, 0.0)] })
 }
 
+/// Turn a PDF page's extracted image into a decoded frame, capping the longest
+/// side at `max_side` like `decode_from_bytes` does. A raw image arrives as
+/// ready RGBA; an embedded JPEG still goes through the decoder.
+fn pdf_decoded(img: PdfImage, max_side: u32) -> Option<Decoded> {
+    match img {
+        PdfImage::Rgba { width, height, data } => {
+            let (w, h, pixels) = downscale_to_limit(width, height, data, max_side).ok()?;
+            Some(Decoded { width: w, height: h, frames: vec![(pixels, 0.0)] })
+        }
+        PdfImage::Encoded(bytes) => decode_from_bytes(&bytes, max_side).ok(),
+    }
+}
+
 /// Total decoded-RGBA budget for one animation. A 60MB, 2080x2648, 48-frame
 /// GIF is 1GB of full-size RGBA — decoding it whole exhausts memory, so frames
 /// are downscaled to collectively fit this budget instead.
@@ -397,18 +411,35 @@ fn spawn_decode(
 ) {
     pool.spawn(move || {
         let cancelled = || !still_relevant(idx, &shared, max_dist);
-        let outcome = match item.read(&cancelled) {
-            Some(data) => match decode_from_bytes(&data, max_side) {
-                Ok(decoded) => {
-                    let _ = decoded_tx.send((idx, decoded));
-                    DecodeOutcome::Ok
+        // PDF pages are decoded straight from the resident document — raw images
+        // arrive as ready RGBA, embedded JPEGs go through the shared decoder —
+        // so they never touch the file-bytes path or its re-encode round trip.
+        let outcome = if item.is_pdf() {
+            if cancelled() {
+                DecodeOutcome::Aborted
+            } else {
+                match item.pdf_image().and_then(|img| pdf_decoded(img, max_side)) {
+                    Some(decoded) => {
+                        let _ = decoded_tx.send((idx, decoded));
+                        DecodeOutcome::Ok
+                    }
+                    None => DecodeOutcome::Failed,
                 }
-                Err(_) => DecodeOutcome::Failed,
-            },
-            // `read` bails on both a stale index and an I/O/archive error;
-            // only a real error counts against the retry budget.
-            None if cancelled() => DecodeOutcome::Aborted,
-            None => DecodeOutcome::Failed,
+            }
+        } else {
+            match item.read(&cancelled) {
+                Some(data) => match decode_from_bytes(&data, max_side) {
+                    Ok(decoded) => {
+                        let _ = decoded_tx.send((idx, decoded));
+                        DecodeOutcome::Ok
+                    }
+                    Err(_) => DecodeOutcome::Failed,
+                },
+                // `read` bails on both a stale index and an I/O/archive error;
+                // only a real error counts against the retry budget.
+                None if cancelled() => DecodeOutcome::Aborted,
+                None => DecodeOutcome::Failed,
+            }
         };
         let _ = done_tx.send((idx, outcome));
         ctx.request_repaint();
@@ -807,15 +838,14 @@ struct KagamiApp {
 
 impl KagamiApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>) -> Self {
-        // Cap textures at both the GPU's max 2D dimension (so uploads never panic)
-        // and our display budget (so we don't decode/store more than we can show).
-        let device_limit = cc
+        // Cap textures only at the GPU's max 2D dimension so uploads never panic;
+        // images are otherwise decoded at their full resolution.
+        let max_side = cc
             .wgpu_render_state
             .as_ref()
             .map(|rs| rs.device.limits().max_texture_dimension_2d)
             .unwrap_or(8192)
             .max(1);
-        let max_side = device_limit.min(DISPLAY_MAX_DIM);
 
         // A placeholder pipeline; `open_paths` installs the real one (now, if a
         // path was passed, or after the startup picker on the first frame).
@@ -880,6 +910,9 @@ impl KagamiApp {
             } else if is_archive_file(&p) {
                 // A directly opened archive browses its entries in page order.
                 items.extend(sort_natural(scan_archive(&p, is_media_name)));
+            } else if is_pdf_file(&p) {
+                // A directly opened PDF browses its page images in page order.
+                items.extend(sort_natural(scan_pdf(&p)));
             } else {
                 items.push(Item::File(p));
             }
@@ -930,16 +963,16 @@ impl KagamiApp {
     }
 
     /// Move the current file to the Trash, then advance to a remaining one.
-    /// Archive entries are read-only views: trashing one would take the whole
-    /// archive (and every other entry) with it, so refuse instead.
+    /// Archive entries and PDF pages are read-only views: trashing one would
+    /// take the whole container (and every other entry) with it, so refuse.
     fn delete_current(&mut self) {
         let cur = self.current_index;
         if self.items.is_empty() || self.deleted.contains(&cur) {
             return;
         }
-        if self.items[cur].is_archived() {
+        if self.items[cur].is_archived() || self.items[cur].is_pdf() {
             eprintln!(
-                "[delete] {} is inside an archive; not trashing",
+                "[delete] {} is inside a container; not trashing",
                 self.items[cur].display(&self.root)
             );
             return;

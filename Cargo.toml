@@ -23,6 +23,12 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # Already in the tree as image's GIF backend; used directly for the cheap
 # frame-count pre-pass (skips pixel data) that sizes the animation budget.
 gif = "0.14"
+# Browse image-only PDFs in place (src/pdf.rs), the same way .zip/.cbz are: each
+# page's embedded image XObject is pulled straight out and handed to the normal
+# image decode path. We never rasterise a PDF page — a PDF that isn't just a
+# bag of scanned images simply yields no viewable entries. default-features off
+# drops chrono/jiff/rayon/time; only the parser + Flate inflate are needed.
+lopdf = { version = "0.44", default-features = false }
 # Video playback is delegated wholesale to libvlc (demux, decode, A/V sync,
 # seeking and audio output). We link the system libvlc (no source build) and
 # pull frames via VLC's "vmem" callbacks into an egui texture, so no OpenGL
