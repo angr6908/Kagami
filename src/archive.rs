@@ -35,6 +35,12 @@ pub enum Item {
     /// `inner` names the PDF's entry within its archive when the PDF is itself
     /// nested inside a zip/cbz, and is None for a plain PDF file on disk.
     Pdf { doc: Arc<crate::pdf::PdfDoc>, page: usize, inner: Option<String>, name: String },
+    /// An archive or PDF that has not been opened yet. Reading it to list its
+    /// entries forces the whole (often large) file to download on OneDrive, so
+    /// it stays a single placeholder slot in the browse list — sorted where the
+    /// file lives — until the viewer navigates near it, then it is expanded in
+    /// place into its real entries. See `KagamiApp::maybe_expand`.
+    Container { path: Arc<PathBuf> },
 }
 
 impl Item {
@@ -44,6 +50,7 @@ impl Item {
             Item::File(p) => p,
             Item::Archived { entry, .. } => Path::new(entry),
             Item::Pdf { name, .. } => Path::new(name),
+            Item::Container { path } => path,
         }
     }
 
@@ -54,6 +61,7 @@ impl Item {
             Item::File(p) => p,
             Item::Archived { archive, .. } => archive,
             Item::Pdf { doc, .. } => doc.disk(),
+            Item::Container { path } => path,
         }
     }
 
@@ -63,6 +71,11 @@ impl Item {
 
     pub fn is_pdf(&self) -> bool {
         matches!(self, Item::Pdf { .. })
+    }
+
+    /// An un-expanded archive/PDF placeholder (see [`Item::Container`]).
+    pub fn is_container(&self) -> bool {
+        matches!(self, Item::Container { .. })
     }
 
     /// Title string relative to the opened root: `sub/img.jpg`, or
@@ -79,6 +92,8 @@ impl Item {
                 Some(entry) => format!("{disk}/{entry}/{name}"),
                 None => format!("{disk}/{name}"),
             },
+            // The archive/PDF file itself while it is still being opened.
+            Item::Container { .. } => disk.into_owned(),
         }
     }
 
@@ -98,6 +113,9 @@ impl Item {
                 }
                 .to_ascii_lowercase()
             }
+            // Sort the placeholder where the archive/PDF file lives, so its
+            // entries (keyed `path/entry`) slot in right after it once expanded.
+            Item::Container { path } => path.to_string_lossy().to_ascii_lowercase(),
         }
     }
 
@@ -128,6 +146,8 @@ impl Item {
             }
             // PDF entries are always images, never video.
             Item::Pdf { .. } => None,
+            // Not playable until expanded into its entries.
+            Item::Container { .. } => None,
         }
     }
 
@@ -147,6 +167,8 @@ impl Item {
             // PDF pages don't use the file-bytes path; they are decoded from
             // the resident document via `pdf_image` in the decode worker.
             Item::Pdf { .. } => None,
+            // A placeholder has no displayable bytes; it is expanded, not read.
+            Item::Container { .. } => None,
         }
     }
 

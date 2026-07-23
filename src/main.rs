@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -28,8 +28,8 @@ mod controls;
 // network download, so we pre-hydrate a wide look-ahead window in the background
 // while giving the on-screen image first claim on bandwidth.
 const HYDRATE_AHEAD: usize = 64;
-const HYDRATE_BEHIND: usize = 16;
-const HYDRATE_WORKERS: usize = 6;
+const HYDRATE_BEHIND: usize = 64;
+const HYDRATE_WORKERS: usize = 8;
 // Decode + keep-as-texture only a small window around the current image; each
 // decoded texture costs real RAM/VRAM.
 const DECODE_AHEAD: usize = 3;
@@ -37,6 +37,12 @@ const DECODE_BEHIND: usize = 2;
 const DECODE_WORKERS: usize = 3;
 const PRIORITY_WORKERS: usize = 2;
 const MAX_DECODE_RETRIES: usize = 3;
+// How close (in browse-list slots) the current image must get to an un-expanded
+// archive/PDF before it is read. Small, so opening a folder never downloads a
+// container the viewer isn't actually approaching. A little look-ahead lets the
+// pages be ready by the time navigation reaches them.
+const EXPAND_AHEAD: usize = 3;
+const EXPAND_BEHIND: usize = 1;
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tiff"];
 
 /// A fixed-size pool of worker threads pulling jobs off a shared channel. This
@@ -94,6 +100,9 @@ enum DecodeOutcome {
 struct SharedState {
     current_idx: AtomicUsize,
     image_count: AtomicUsize,
+    /// Set when a newer pipeline supersedes this one, so its coordinator (which
+    /// otherwise loops forever) exits instead of spinning on a stale list.
+    cancelled: AtomicBool,
 }
 
 /// Natural-order comparison: runs of digits compare by numeric value, so
@@ -169,10 +178,13 @@ fn sort_natural(items: Vec<Item>) -> Vec<Item> {
     keyed.into_iter().map(|(_, it)| it).collect()
 }
 
-fn scan_directory(dir: &Path) -> Vec<Item> {
-    // Walk the tree iteratively, descending into subfolders. file_type() does not
-    // follow symlinks, so symlinked directories are skipped and can't cause loops.
-    let mut items = Vec::new();
+/// Walk the tree iteratively, descending into subfolders. Plain media files go
+/// into `media`; archives and PDFs are only *recorded* in `containers`, not
+/// opened — reading a container enumerates its entries but, on OneDrive, forces
+/// the whole (often huge) file to download first, so that is deferred to a
+/// background second phase. file_type() does not follow symlinks, so symlinked
+/// directories are skipped and can't cause loops.
+fn walk_directory(dir: &Path, media: &mut Vec<Item>, containers: &mut Vec<PathBuf>) {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -184,18 +196,77 @@ fn scan_directory(dir: &Path) -> Vec<Item> {
                 Ok(ft) if ft.is_dir() => stack.push(p),
                 Ok(ft) if !ft.is_symlink() => {
                     if is_media_name(&p) {
-                        items.push(Item::File(p));
-                    } else if is_archive_file(&p) {
-                        items.extend(scan_archive(&p, is_media_name));
-                    } else if is_pdf_file(&p) {
-                        items.extend(scan_pdf(&p));
+                        media.push(Item::File(p));
+                    } else if is_archive_file(&p) || is_pdf_file(&p) {
+                        containers.push(p);
                     }
                 }
                 _ => {}
             }
         }
     }
-    sort_natural(items)
+}
+
+/// Enumerate one archive's or PDF's browsable entries. This reads the file, so
+/// on OneDrive it blocks until the placeholder has hydrated — run off the UI
+/// thread, and only once the viewer navigates near the container.
+fn expand_container(p: &Path) -> Vec<Item> {
+    if is_archive_file(p) {
+        scan_archive(p, is_media_name)
+    } else if is_pdf_file(p) {
+        scan_pdf(p)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The result of a completed folder scan: the browsing list and the root titles
+/// are shown relative to. Produced on a background thread because even the
+/// metadata-only tree walk can be slow on a large OneDrive tree.
+struct ScanResult {
+    root: PathBuf,
+    items: Vec<Item>,
+}
+
+/// A container expansion delivered back to the UI: the archive/PDF that was
+/// read and the entries it yielded (empty if unreadable/encrypted).
+struct ExpandResult {
+    path: PathBuf,
+    entries: Vec<Item>,
+}
+
+/// Scan an opened selection into a browsing list. The tree is walked with
+/// metadata only — archives and PDFs become single [`Item::Container`]
+/// placeholders rather than being opened, so nothing downloads until the viewer
+/// browses near it. A single opened directory is its own root; otherwise titles
+/// are relative to the first path's parent.
+fn run_scan(opened: Vec<PathBuf>, tx: Sender<ScanResult>, ctx: egui::Context) {
+    let root = match opened.as_slice() {
+        [] => {
+            let _ = tx.send(ScanResult { root: PathBuf::new(), items: Vec::new() });
+            return;
+        }
+        [p] if p.is_dir() => p.clone(),
+        [p, ..] => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
+    };
+
+    let mut items = Vec::new();
+    let mut containers = Vec::new();
+    for p in opened {
+        if p.is_dir() {
+            walk_directory(&p, &mut items, &mut containers);
+        } else if is_archive_file(&p) || is_pdf_file(&p) {
+            containers.push(p);
+        } else {
+            items.push(Item::File(p));
+        }
+    }
+    for c in containers {
+        items.push(Item::Container { path: Arc::new(c) });
+    }
+
+    let _ = tx.send(ScanResult { root, items: sort_natural(items) });
+    ctx.request_repaint();
 }
 
 fn circular_dist(idx: usize, cur: usize, count: usize) -> usize {
@@ -510,6 +581,13 @@ fn run_coordinator(
     let max_dc_in_flight = DECODE_WORKERS + PRIORITY_WORKERS;
 
     loop {
+        // A newer pipeline (another folder opened, or this scan's second phase
+        // installing the full list) supersedes us: stop rather than keep the
+        // pools and this loop alive forever on a stale list.
+        if shared.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
         // Drain completed work.
         while let Ok((path, ok)) = hy_done_rx.try_recv() {
             state.apply_hydrate(path, ok);
@@ -522,12 +600,16 @@ fn run_coordinator(
 
         // Videos are decoded/played by the on-screen VideoPlayer, not here, so
         // treat a current video as "ready" to let look-ahead for images proceed.
+        // An un-expanded archive/PDF placeholder has nothing to decode either
+        // (the UI reads it on approach), so treat it as ready too.
         let current_is_video = is_video_file(items[cur].media_name());
+        let current_is_container = items[cur].is_container();
 
         // Highest priority: get the on-screen image decoded. It runs on its own
         // pool so it never waits behind look-ahead work, and it gets first claim
         // on download bandwidth because nothing else is scheduled until it lands.
-        let current_ready = current_is_video || state.decoded_sent.contains(&cur);
+        let current_ready =
+            current_is_video || current_is_container || state.decoded_sent.contains(&cur);
         if !current_ready
             && !state.dc_in_flight.contains(&cur)
             && *state.failed.get(&cur).unwrap_or(&0) < MAX_DECODE_RETRIES
@@ -787,6 +869,20 @@ struct KagamiApp {
     current_index: usize,
     cache: HashMap<usize, CachedImage>,
     decoded_rx: Receiver<(usize, Decoded)>,
+    /// Receives the result of the current off-thread folder scan, if one is
+    /// running. Replacing it (a newer open) drops this receiver so a stale
+    /// scan's result is ignored.
+    scan_rx: Option<Receiver<ScanResult>>,
+    /// True while a scan is in flight and no pipeline is installed yet, so the
+    /// empty view shows "Scanning…" rather than "No images found".
+    scanning: bool,
+    /// Archive/PDF expansions delivered from background reader threads, folded
+    /// into the list in place of their placeholder as they arrive.
+    expand_rx: Receiver<ExpandResult>,
+    expand_tx: Sender<ExpandResult>,
+    /// Container paths currently being read, so a placeholder is only expanded
+    /// once even while its read is still in flight.
+    expanding: HashSet<PathBuf>,
     shared: Arc<SharedState>,
     last_title_index: Option<usize>,
     max_side: u32,
@@ -850,15 +946,22 @@ impl KagamiApp {
         // A placeholder pipeline; `open_paths` installs the real one (now, if a
         // path was passed, or after the startup picker on the first frame).
         let (_tx, decoded_rx) = crossbeam_channel::unbounded();
+        let (expand_tx, expand_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             items: Arc::new(Vec::new()),
             root: PathBuf::new(),
             current_index: 0,
             cache: HashMap::new(),
             decoded_rx,
+            scan_rx: None,
+            scanning: false,
+            expand_rx,
+            expand_tx,
+            expanding: HashSet::new(),
             shared: Arc::new(SharedState {
                 current_idx: AtomicUsize::new(0),
                 image_count: AtomicUsize::new(0),
+                cancelled: AtomicBool::new(false),
             }),
             last_title_index: None,
             max_side,
@@ -890,39 +993,68 @@ impl KagamiApp {
         self.focus_until = Some(std::time::Instant::now() + Duration::from_millis(ms));
     }
 
-    /// Open a selection of paths and (re)start the background coordinator.
-    /// Each directory is scanned (with subfolders) into the browsing list;
-    /// each file is included as-is — siblings of a picked file are never
-    /// loaded, so opening files shows exactly those files.
+    /// Open a selection of paths. The scan (which walks subfolders and, on
+    /// OneDrive, can block on network hydration of placeholder directories)
+    /// runs on a background thread so the window never freezes; the real
+    /// pipeline is installed by `install_scanned` when the result arrives.
+    /// Until then the view shows "Scanning…".
     fn open_paths(&mut self, opened: Vec<PathBuf>) {
-        // Root is what titles are shown relative to: the directory itself when
-        // one was opened, otherwise the first path's parent. Files outside it
-        // fall back to their full path in the title.
-        let root = match opened.as_slice() {
-            [] => return,
-            [p] if p.is_dir() => p.clone(),
-            [p, ..] => p.parent().unwrap_or(Path::new(".")).to_path_buf(),
-        };
-        let mut items = Vec::new();
-        for p in opened {
-            if p.is_dir() {
-                items.extend(scan_directory(&p));
-            } else if is_archive_file(&p) {
-                // A directly opened archive browses its entries in page order.
-                items.extend(sort_natural(scan_archive(&p, is_media_name)));
-            } else if is_pdf_file(&p) {
-                // A directly opened PDF browses its page images in page order.
-                items.extend(sort_natural(scan_pdf(&p)));
-            } else {
-                items.push(Item::File(p));
-            }
+        if opened.is_empty() {
+            return;
         }
-        let current_index = 0;
-        let items = Arc::new(items);
+        // Scan off the UI thread (the tree walk can be slow on a big OneDrive
+        // tree). Replacing `scan_rx` drops any prior receiver, so a still-running
+        // older scan's result is discarded.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let ctx = self.egui_ctx.clone();
+        thread::spawn(move || run_scan(opened, tx, ctx));
+        self.scan_rx = Some(rx);
+        self.scanning = true;
+        // Tear down the current pipeline so the stale folder stops showing while
+        // the new scan runs.
+        self.tear_down();
+    }
 
+    /// Clear the browsing state to an empty pipeline. Used while a scan is in
+    /// flight so no stale folder shows.
+    fn tear_down(&mut self) {
+        self.root = PathBuf::new();
+        self.cache.clear();
+        self.deleted.clear();
+        self.expanding.clear();
+        self.video = None;
+        self.video_error = None;
+        self.video_positions.clear();
+        self.last_title_index = None;
+        self.reset_zoom();
+        self.start_coordinator(Arc::new(Vec::new()), 0);
+    }
+
+    /// Install the browsing list from a completed scan and start the background
+    /// coordinator.
+    fn install_scanned(&mut self, result: ScanResult) {
+        let ScanResult { root, items } = result;
+        self.root = root;
+        self.cache.clear();
+        self.deleted.clear();
+        self.expanding.clear();
+        self.video = None;
+        self.video_error = None;
+        self.video_positions.clear();
+        self.last_title_index = None;
+        self.reset_zoom();
+        self.start_coordinator(Arc::new(items), 0);
+    }
+
+    /// Point the pipeline at `items` with the view on `current_index`, spawning
+    /// a fresh coordinator and cancelling the previous one (which otherwise
+    /// loops forever). Callers set up `root`/`cache`/etc. around this.
+    fn start_coordinator(&mut self, items: Arc<Vec<Item>>, current_index: usize) {
+        self.shared.cancelled.store(true, Ordering::Relaxed);
         let shared = Arc::new(SharedState {
             current_idx: AtomicUsize::new(current_index),
             image_count: AtomicUsize::new(items.len()),
+            cancelled: AtomicBool::new(false),
         });
         let (decoded_tx, decoded_rx) = crossbeam_channel::unbounded();
         let items_arc = items.clone();
@@ -932,17 +1064,93 @@ impl KagamiApp {
         thread::spawn(move || run_coordinator(items_arc, shared2, decoded_tx, ctx, max_side));
 
         self.items = items;
-        self.root = root;
         self.current_index = current_index;
-        self.cache.clear();
-        self.decoded_rx = decoded_rx;
         self.shared = shared;
+        self.decoded_rx = decoded_rx;
+    }
+
+    /// Kick off reading any un-expanded archive/PDF whose placeholder is within
+    /// a small window of the current view, so browsing near it (and only then)
+    /// downloads it. Runs each frame; the `expanding` set keeps it to one read
+    /// per container.
+    fn maybe_expand(&mut self) {
+        let count = self.items.len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.current_index;
+        let mut idxs = window_indices(cur, count, EXPAND_AHEAD, EXPAND_BEHIND);
+        idxs.push(cur);
+        for i in idxs {
+            let Item::Container { path } = &self.items[i] else {
+                continue;
+            };
+            let path = path.as_ref().clone();
+            if !self.expanding.insert(path.clone()) {
+                continue; // already reading this one
+            }
+            let tx = self.expand_tx.clone();
+            let ctx = self.egui_ctx.clone();
+            thread::spawn(move || {
+                let entries = expand_container(&path);
+                let _ = tx.send(ExpandResult { path, entries });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Fold a finished container expansion into the list in place of its
+    /// placeholder, keeping the on-screen item (and decoded textures) in view.
+    fn apply_expansion(&mut self, res: ExpandResult) {
+        self.expanding.remove(&res.path);
+        let old = self.items.clone();
+        let cpath = res.path.as_path();
+
+        // Was the placeholder the item on screen? If so, land on the first page
+        // of the archive/PDF just opened rather than jumping to the start.
+        let on_placeholder = matches!(
+            old.get(self.current_index),
+            Some(Item::Container { path }) if path.as_path() == cpath
+        );
+
+        let mut next: Vec<Item> = old
+            .iter()
+            .filter(|it| !matches!(it, Item::Container { path } if path.as_path() == cpath))
+            .cloned()
+            .collect();
+        next.extend(res.entries);
+        let next = sort_natural(next);
+
+        // Map indexed state across the reordered list by item identity.
+        let mut key_to_new: HashMap<String, usize> = HashMap::with_capacity(next.len());
+        for (i, it) in next.iter().enumerate() {
+            key_to_new.entry(it.sort_key()).or_insert(i);
+        }
+        let remap = |old_idx: usize| -> Option<usize> {
+            old.get(old_idx).and_then(|it| key_to_new.get(&it.sort_key()).copied())
+        };
+
+        let current_index = if on_placeholder {
+            next.iter().position(|it| it.disk_path() == cpath).unwrap_or(0)
+        } else {
+            remap(self.current_index).unwrap_or(0)
+        };
+
+        // Preserve decoded textures, deletions and any open video across the
+        // reindex so the view doesn't flicker or lose its trashed set.
+        let mut old_cache = std::mem::take(&mut self.cache);
+        let mut new_cache = HashMap::with_capacity(old_cache.len());
+        for (old_idx, img) in old_cache.drain() {
+            if let Some(n) = remap(old_idx) {
+                new_cache.insert(n, img);
+            }
+        }
+        self.cache = new_cache;
+        self.deleted = self.deleted.iter().filter_map(|&i| remap(i)).collect();
+        self.video = self.video.take().and_then(|(idx, p)| remap(idx).map(|n| (n, p)));
         self.last_title_index = None;
-        self.deleted.clear();
-        self.video = None;
-        self.video_error = None;
-        self.video_positions.clear();
-        self.reset_zoom();
+
+        self.start_coordinator(Arc::new(next), current_index);
     }
 
     /// Nearest non-deleted index from `start` in direction `dir` (+1 / -1),
@@ -975,6 +1183,10 @@ impl KagamiApp {
                 "[delete] {} is inside a container; not trashing",
                 self.items[cur].display(&self.root)
             );
+            return;
+        }
+        if self.items[cur].is_container() {
+            // Still opening; nothing meaningful to trash yet.
             return;
         }
         let path = self.items[cur].disk_path();
@@ -1242,6 +1454,20 @@ impl eframe::App for KagamiApp {
             }
         }
 
+        // The background folder scan finished: install its browsing list.
+        if let Some(rx) = &self.scan_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            self.scan_rx = None;
+            self.scanning = false;
+            self.install_scanned(result);
+        }
+
+        // Fold in any archive/PDF that finished expanding.
+        while let Ok(res) = self.expand_rx.try_recv() {
+            self.apply_expansion(res);
+        }
+
         while let Ok((index, decoded)) = self.decoded_rx.try_recv() {
             self.cache.entry(index).or_insert_with(|| {
                 let size = [decoded.width as usize, decoded.height as usize];
@@ -1277,9 +1503,14 @@ impl eframe::App for KagamiApp {
                 }
 
                 if self.items.is_empty() || self.deleted.len() == self.items.len() {
+                    let message = if self.scanning {
+                        "Scanning…"
+                    } else {
+                        "No images found — press N to open"
+                    };
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            egui::RichText::new("No images found — press N to open")
+                            egui::RichText::new(message)
                                 .color(egui::Color32::WHITE)
                                 .size(24.0),
                         );
@@ -1335,6 +1566,9 @@ impl eframe::App for KagamiApp {
                     self.prune_cache();
                     self.reset_zoom();
                 }
+
+                // Read any archive/PDF the view has come near (and only those).
+                self.maybe_expand();
 
                 self.update_title(ui.ctx());
 
